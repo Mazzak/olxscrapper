@@ -11,6 +11,7 @@ from openpyxl import Workbook
 import time
 import json
 import os
+from urllib.parse import quote
 
 # Alertas (Windows)
 try:
@@ -22,16 +23,36 @@ except Exception:
 APP_TITLE = "OLX Price Scanner"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# ficheiros locais
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FAV_FILE = os.path.join(BASE_DIR, "favorites.json")
 SEEN_FILE = os.path.join(BASE_DIR, "seen_links.json")
 
-ALL_ANUNCIOS = []   # resultados brutos da última pesquisa
-LAST_QUERY_KEY = "" # chave da pesquisa actual (para vistos/novos)
+RESULT_COLS = ("Link", "Preço", "Negociável", "Novo", "Data", "Localização")
+FAV_COLS = ("Link", "Preço", "Negociável", "Data", "Localização")
+
+ALL_ANUNCIOS = []
+LAST_QUERY_KEY = ""
+LAST_SEARCH_PARAMS = None
+
+# Lock para impedir que o botão "Pesquisar" fique "preso"
+RUN_LOCK = threading.Lock()
+
+AUTO_REFRESH_JOB = None
+REFRESH_OPTIONS = {
+    "Off": 0,
+    "5 min": 5,
+    "10 min": 10,
+    "15 min": 15,
+    "30 min": 30,
+    "60 min": 60
+}
+
+SORT_RESULTS = {"col": None, "reverse": False}
+SORT_FAVS = {"col": None, "reverse": False}
+
 
 # =========================
-# PERSISTÊNCIA (JSON)
+# JSON
 # =========================
 
 def load_json(path, default):
@@ -57,21 +78,29 @@ def save_favorites(favs):
     save_json(FAV_FILE, favs)
 
 def load_seen():
-    # estrutura: { "query_key": ["link1","link2", ...] }
-    return load_json(SEEN_FILE, {})
+    return load_json(SEEN_FILE, {})  # {query_key: [links...]}
 
 def save_seen(seen_map):
     save_json(SEEN_FILE, seen_map)
 
+
 # =========================
-# UTILITÁRIOS
+# UTIL
 # =========================
+
+def now_hhmmss():
+    return time.strftime("%H:%M:%S")
+
+def normalize_query_for_olx(q: str) -> str:
+    q = (q or "").strip()
+    q = re.sub(r"\s+", "-", q)
+    return quote(q, safe="-")
 
 def extrair_preco(texto):
     if not texto:
         return None
     texto = texto.lower().replace("negociável", "").replace("negociavel", "")
-    m = re.search(r'(\d+)', texto.replace('.', ''))
+    m = re.search(r"(\d+)", texto.replace(".", ""))
     return int(m.group(1)) if m else None
 
 def detectar_negociavel(texto):
@@ -79,17 +108,8 @@ def detectar_negociavel(texto):
         return "N"
     return "Y" if "negoci" in texto.lower() else "N"
 
-def ajustar_colunas(treeview):
-    # limites (px)
-    MIN_W = {"Preço": 90, "Negociável": 90, "Data": 140, "Localização": 180, "Link": 420, "Novo": 70}
-    MAX_W = {"Preço": 140, "Negociável": 120, "Data": 260, "Localização": 360, "Link": 650, "Novo": 90}
-
-    for col in treeview["columns"]:
-        max_len = max([len(str(treeview.set(k, col))) for k in treeview.get_children()] + [len(col)])
-        w = max_len * 8
-        w = max(w, MIN_W.get(col, 100))
-        w = min(w, MAX_W.get(col, 600))
-        treeview.column(col, width=w)
+def query_key(produto, min_price, max_price):
+    return f"{produto.strip().lower()}|{min_price}|{max_price}"
 
 def set_status(text):
     status_var.set(text)
@@ -110,23 +130,35 @@ def beep_alert():
         except Exception:
             pass
 
-def query_key(produto, min_price, max_price):
-    # chave estável (não inclui páginas nem filtros)
-    return f"{produto.strip().lower()}|{min_price}|{max_price}"
+def ajustar_colunas(treeview):
+    MIN_W = {"Preço": 90, "Negociável": 90, "Data": 140, "Localização": 180, "Link": 420, "Novo": 70}
+    MAX_W = {"Preço": 140, "Negociável": 120, "Data": 260, "Localização": 360, "Link": 650, "Novo": 90}
+
+    for col in treeview["columns"]:
+        max_len = max([len(str(treeview.set(k, col))) for k in treeview.get_children()] + [len(col)])
+        w = max_len * 8
+        w = max(w, MIN_W.get(col, 100))
+        w = min(w, MAX_W.get(col, 650))
+        treeview.column(col, width=w)
+
 
 # =========================
-# SCRAPING OLX
+# SCRAPE
 # =========================
 
-def pesquisar_olx(query, min_price=0, max_price=9999, max_paginas=10, on_page_progress=None):
+def pesquisar_olx(query, min_price=0, max_price=9999, max_paginas=10, only_negotiable=False, on_page_progress=None):
     resultados = []
     seen_links = set()
+    qslug = normalize_query_for_olx(query)
 
     for pagina in range(1, max_paginas + 1):
         if on_page_progress:
             on_page_progress(pagina)
 
-        url = f"https://www.olx.pt/ads/q-{query}/?page={pagina}"
+        url = f"https://www.olx.pt/ads/q-{qslug}/?page={pagina}"
+        if only_negotiable:
+            url += "&search[filter_float_negotiable]=1"
+
         try:
             r = requests.get(url, headers=HEADERS, timeout=12)
         except requests.RequestException:
@@ -175,80 +207,54 @@ def pesquisar_olx(query, min_price=0, max_price=9999, max_paginas=10, on_page_pr
                 "preco": preco_limpo,
                 "preco_num": preco_num,
                 "negociavel": negociavel,
+                "novo": "N",
                 "data": data,
-                "localizacao": localizacao,
-                "novo": "N"
+                "localizacao": localizacao
             })
 
     return resultados
 
+
 # =========================
-# FILTROS (RESULTADOS)
+# FILTROS
 # =========================
 
-def passa_filtro_localizacao(localizacao: str, termo: str, modo: str) -> bool:
-    loc = (localizacao or "").strip().lower()
-    t = (termo or "").strip().lower()
-    if not t:
-        return True
-
-    if modo == "Contém":
-        return t in loc
-    if modo == "Começa por":
-        return loc.startswith(t)
-    if modo == "Igual":
-        return loc == t
+def passa_filtros_base(a) -> bool:
+    if var_negociavel.get() and a.get("negociavel") != "Y":
+        return False
+    termo_loc = entry_loc.get().strip().lower()
+    if termo_loc and termo_loc not in (a.get("localizacao") or "").lower():
+        return False
     return True
 
 def aplicar_filtros():
     if not ALL_ANUNCIOS:
-        return
+        for row in tree.get_children():
+            tree.delete(row)
+        lbl_stats.config(text="")
+        return [], None
 
-    filtrados = ALL_ANUNCIOS[:]
-
-    # só negociáveis
-    if var_negociavel.get():
-        filtrados = [a for a in filtrados if a["negociavel"] == "Y"]
-
-    # filtro localização
-    termo_loc = entry_loc.get().strip()
-    modo_loc = var_loc_mode.get()
-    if termo_loc:
-        filtrados = [a for a in filtrados if passa_filtro_localizacao(a.get("localizacao", ""), termo_loc, modo_loc)]
-
-    # média com base no filtrado
+    filtrados = [a for a in ALL_ANUNCIOS if passa_filtros_base(a)]
     precos = [a["preco_num"] for a in filtrados if a["preco_num"]]
     preco_medio = mean(precos) if precos else None
 
-    # só abaixo da média
     if var_abaixo_media.get() and preco_medio is not None:
         filtrados = [a for a in filtrados if a["preco_num"] <= preco_medio]
         precos = [a["preco_num"] for a in filtrados if a["preco_num"]]
         preco_medio = mean(precos) if precos else None
 
-    # refrescar tabela principal
     for row in tree.get_children():
         tree.delete(row)
 
     new_count = 0
     for a in filtrados:
-        row = tree.insert(
-            "",
-            tk.END,
-            values=(a["link"], a["preco"], a["negociavel"], a["novo"], a["data"], a["localizacao"])
-        )
-
+        row = tree.insert("", tk.END, values=(a["link"], a["preco"], a["negociavel"], a["novo"], a["data"], a["localizacao"]))
         if a.get("novo") == "Y":
             tree.item(row, tags=("novo",))
             new_count += 1
+        if preco_medio is not None and a["preco_num"] <= preco_medio and a.get("novo") != "Y":
+            tree.item(row, tags=("bom_preco",))
 
-        # highlight verde para <= média
-        if preco_medio is not None and a["preco_num"] <= preco_medio:
-            # se também for NOVO, mantém a cor NOVO (mais importante)
-            if a.get("novo") != "Y":
-                tree.item(row, tags=("bom_preco",))
-
-    # stats reflectem filtrados
     if precos:
         lbl_stats.config(
             text=f"Preço mín: {min(precos)} € | Preço máx: {max(precos)} € | "
@@ -258,7 +264,23 @@ def aplicar_filtros():
         lbl_stats.config(text=f"Sem preços válidos | Anúncios: {len(filtrados)} | NOVOS: {new_count}")
 
     ajustar_colunas(tree)
-    set_status("Filtros aplicados ✅")
+    atualizar_setas_cabecalho_resultados()
+    return filtrados, preco_medio
+
+def contar_novos_dentro_do_filtro():
+    if not ALL_ANUNCIOS:
+        return 0
+
+    base = [a for a in ALL_ANUNCIOS if passa_filtros_base(a)]
+    precos = [a["preco_num"] for a in base if a["preco_num"]]
+    media = mean(precos) if precos else None
+
+    final = base
+    if var_abaixo_media.get() and media is not None:
+        final = [a for a in base if a["preco_num"] <= media]
+
+    return sum(1 for a in final if a.get("novo") == "Y")
+
 
 # =========================
 # FAVORITOS
@@ -268,11 +290,10 @@ def refresh_favorites_tab():
     favs = load_favorites()
     for row in fav_tree.get_children():
         fav_tree.delete(row)
-
     for f in favs:
         fav_tree.insert("", tk.END, values=(f["link"], f["preco"], f["negociavel"], f["data"], f["localizacao"]))
-
     ajustar_colunas(fav_tree)
+    atualizar_setas_cabecalho_favs()
 
 def get_selected_row_values(treeview):
     item = treeview.focus()
@@ -287,8 +308,8 @@ def add_selected_to_favorites():
         return
 
     link, preco, negociavel, novo, data, localizacao = vals
-
     favs = load_favorites()
+
     if any(f.get("link") == link for f in favs):
         set_status("Já está nos favoritos ⭐")
         return
@@ -301,7 +322,6 @@ def add_selected_to_favorites():
         "localizacao": localizacao,
         "added_at": time.strftime("%Y-%m-%d %H:%M:%S")
     })
-
     save_favorites(favs)
     refresh_favorites_tab()
     set_status("Adicionado aos favoritos ⭐")
@@ -311,10 +331,8 @@ def remove_selected_favorite():
     if not vals:
         messagebox.showinfo(APP_TITLE, "Selecciona um favorito.")
         return
-
     link = vals[0]
-    favs = load_favorites()
-    favs = [f for f in favs if f.get("link") != link]
+    favs = [f for f in load_favorites() if f.get("link") != link]
     save_favorites(favs)
     refresh_favorites_tab()
     set_status("Favorito removido 🗑️")
@@ -325,45 +343,181 @@ def abrir_link_de_tree(treeview, event):
         link = treeview.item(item)["values"][0]
         webbrowser.open(link)
 
-def copiar_link_tree(treeview):
-    vals = get_selected_row_values(treeview)
-    if not vals:
+
+# =========================
+# ORDENAÇÃO + SETAS ▲/▼
+# =========================
+
+def atualizar_setas_cabecalho_resultados():
+    for c in RESULT_COLS:
+        txt = c
+        if SORT_RESULTS["col"] == c:
+            txt = f"{c} {'▼' if SORT_RESULTS['reverse'] else '▲'}"
+        tree.heading(c, text=txt)
+
+def atualizar_setas_cabecalho_favs():
+    for c in FAV_COLS:
+        txt = c
+        if SORT_FAVS["col"] == c:
+            txt = f"{c} {'▼' if SORT_FAVS['reverse'] else '▲'}"
+        fav_tree.heading(c, text=txt)
+
+def ordenar_treeview(treeview, sort_state, col, is_results=True):
+    reverse = False
+    if sort_state["col"] == col:
+        reverse = not sort_state["reverse"]
+
+    dados = []
+    for item in treeview.get_children():
+        valor = treeview.set(item, col)
+
+        if col == "Preço":
+            dados.append((extrair_preco(valor) or 0, item))
+        elif col == "Novo":
+            dados.append((0 if valor == "Y" else 1, item))
+        else:
+            dados.append((valor.lower(), item))
+
+    dados.sort(reverse=reverse, key=lambda x: x[0])
+    for i, (_, item) in enumerate(dados):
+        treeview.move(item, "", i)
+
+    sort_state["col"] = col
+    sort_state["reverse"] = reverse
+
+    if is_results:
+        atualizar_setas_cabecalho_resultados()
+    else:
+        atualizar_setas_cabecalho_favs()
+
+
+# =========================
+# AUTO-REFRESH
+# =========================
+
+def cancel_auto_refresh():
+    global AUTO_REFRESH_JOB
+    if AUTO_REFRESH_JOB is not None:
+        try:
+            root.after_cancel(AUTO_REFRESH_JOB)
+        except Exception:
+            pass
+        AUTO_REFRESH_JOB = None
+
+def schedule_next_refresh(minutes: int):
+    global AUTO_REFRESH_JOB
+    cancel_auto_refresh()
+    if minutes <= 0:
         return
-    link = vals[0]
-    root.clipboard_clear()
-    root.clipboard_append(link)
-    set_status("Link copiado 📋")
+    AUTO_REFRESH_JOB = root.after(minutes * 60 * 1000, auto_refresh_tick)
+
+def auto_refresh_tick():
+    minutes = REFRESH_OPTIONS.get(var_refresh.get(), 0)
+    if minutes <= 0:
+        return
+
+    if LAST_SEARCH_PARAMS:
+        produto, min_price, max_price, max_pages = LAST_SEARCH_PARAMS
+        run_search(produto, min_price, max_price, max_pages, is_auto=True)
+
+    schedule_next_refresh(minutes)
+
+def on_refresh_changed(event=None):
+    minutes = REFRESH_OPTIONS.get(var_refresh.get(), 0)
+    if minutes <= 0:
+        cancel_auto_refresh()
+        set_status(f"Auto-refresh: Off ({now_hhmmss()})")
+        return
+    schedule_next_refresh(minutes)
+    set_status(f"Auto-refresh: a cada {minutes} min ✅ ({now_hhmmss()})")
+
 
 # =========================
-# UI ACTIONS
+# PESQUISA (robusta)
 # =========================
 
-def bloquear_ui(is_running: bool):
-    state = "disabled" if is_running else "normal"
+def set_controls_running(running: bool):
+    state = "disabled" if running else "normal"
     btn_pesquisar.config(state=state)
     btn_csv.config(state=state)
     btn_xlsx.config(state=state)
-
     entry_produto.config(state=state)
     entry_min.config(state=state)
     entry_max.config(state=state)
     entry_paginas.config(state=state)
 
-    # filtros
-    can_filter = (not is_running) and bool(ALL_ANUNCIOS)
-    chk_negociavel.config(state="normal" if can_filter else "disabled")
-    chk_abaixo_media.config(state="normal" if can_filter else "disabled")
-    entry_loc.config(state="normal" if can_filter else "disabled")
-    cmb_loc_mode.config(state="readonly" if can_filter else "disabled")
+def run_search(produto, min_price, max_price, max_pages, is_auto=False):
+    global LAST_QUERY_KEY, ALL_ANUNCIOS, LAST_SEARCH_PARAMS
+
+    if not RUN_LOCK.acquire(blocking=False):
+        set_status("Já estou a pesquisar… 🙂")
+        return
+
+    start_time = time.perf_counter()
+
+    def worker():
+        global LAST_QUERY_KEY, ALL_ANUNCIOS, LAST_SEARCH_PARAMS
+        try:
+            LAST_QUERY_KEY = query_key(produto, min_price, max_price)
+            seen_map = load_seen()
+            seen_set = set(seen_map.get(LAST_QUERY_KEY, []))
+
+            only_neg = var_negociavel.get()
+
+            def on_page(p):
+                root.after(0, lambda: (set_status(f"A pesquisar página {p}/{max_pages}…"), set_progress(p)))
+
+            anuncios = pesquisar_olx(produto, min_price, max_price, max_pages, only_negotiable=only_neg, on_page_progress=on_page)
+
+            if not anuncios:
+                elapsed = time.perf_counter() - start_time
+                root.after(0, lambda: set_status(f"0 anúncios encontrados ❗ ({elapsed:.1f}s)"))
+                return
+
+            for a in anuncios:
+                a["novo"] = "Y" if a["link"] not in seen_set else "N"
+
+            seen_map[LAST_QUERY_KEY] = list(seen_set.union({a["link"] for a in anuncios}))
+            save_seen(seen_map)
+
+            ALL_ANUNCIOS = anuncios
+            LAST_SEARCH_PARAMS = (produto, min_price, max_price, max_pages)
+
+            elapsed = time.perf_counter() - start_time
+
+            def update_ui():
+                aplicar_filtros()
+                refresh_favorites_tab()
+
+                novos_no_filtro = contar_novos_dentro_do_filtro()
+                if novos_no_filtro > 0:
+                    beep_alert()
+                    set_status(f"{'Auto-refresh' if is_auto else 'Pesquisa'} ✅ ({elapsed:.1f}s) — {novos_no_filtro} NOVO(s) no filtro 🔔 ({now_hhmmss()})")
+                else:
+                    set_status(f"{'Auto-refresh' if is_auto else 'Pesquisa'} ✅ ({elapsed:.1f}s) — sem novos no filtro ({now_hhmmss()})")
+
+            root.after(0, update_ui)
+
+        except Exception as e:
+            root.after(0, lambda: messagebox.showerror(APP_TITLE, f"Erro: {e}"))
+        finally:
+            RUN_LOCK.release()
+            root.after(0, lambda: set_controls_running(False))
+
+    if not is_auto:
+        set_controls_running(True)
+        set_progress(0, maximum=max_pages)
+        set_status("A iniciar pesquisa…")
+    else:
+        set_status(f"Auto-refresh a correr… ({now_hhmmss()})")
+
+    threading.Thread(target=worker, daemon=True).start()
 
 def buscar():
-    global LAST_QUERY_KEY, ALL_ANUNCIOS
-
     produto = entry_produto.get().strip()
     if not produto:
         messagebox.showinfo(APP_TITLE, "Escreve um produto para pesquisar.")
         return
-
     try:
         min_price = int(entry_min.get())
         max_price = int(entry_max.get())
@@ -372,133 +526,44 @@ def buscar():
         messagebox.showerror(APP_TITLE, "Preços/Páginas inválidos (usa números).")
         return
 
-    # reset filtros visuais
-    var_negociavel.set(False)
-    var_abaixo_media.set(False)
-    var_loc_mode.set("Contém")
-    entry_loc.delete(0, tk.END)
+    run_search(produto, min_price, max_price, max_pages, is_auto=False)
 
-    for row in tree.get_children():
-        tree.delete(row)
+def on_filters_changed(*_):
+    if ALL_ANUNCIOS:
+        aplicar_filtros()
 
-    lbl_stats.config(text="")
-    set_status("A iniciar pesquisa…")
-    set_progress(0, maximum=max_pages)
-    bloquear_ui(True)
 
-    start_time = time.perf_counter()
-
-    # preparar seen/novos
-    LAST_QUERY_KEY = query_key(produto, min_price, max_price)
-    seen_map = load_seen()
-    seen_set = set(seen_map.get(LAST_QUERY_KEY, []))
-
-    def worker():
-        nonlocal seen_map, seen_set
-        try:
-            def on_page(p):
-                root.after(0, lambda: (set_status(f"A pesquisar página {p}/{max_pages}…"),
-                                      set_progress(p)))
-
-            anuncios = pesquisar_olx(produto, min_price, max_price, max_pages, on_page_progress=on_page)
-
-            # marcar NOVOS e actualizar seen
-            new_count = 0
-            for a in anuncios:
-                if a["link"] not in seen_set:
-                    a["novo"] = "Y"
-                    new_count += 1
-                else:
-                    a["novo"] = "N"
-
-            # actualiza o visto (guarda todos os links encontrados agora)
-            updated_seen = list(seen_set.union({a["link"] for a in anuncios}))
-            seen_map[LAST_QUERY_KEY] = updated_seen
-            save_seen(seen_map)
-
-            # guardar resultados globais
-            ALL_ANUNCIOS = anuncios
-
-            elapsed = time.perf_counter() - start_time
-
-            def update_ui():
-                bloquear_ui(False)
-                aplicar_filtros()
-                refresh_favorites_tab()
-
-                if new_count > 0:
-                    beep_alert()
-                    set_status(f"Pesquisa concluída ✅ ({elapsed:.1f}s) — {new_count} NOVO(s) 🔔")
-                else:
-                    set_status(f"Pesquisa concluída ✅ ({elapsed:.1f}s) — sem novos")
-
-            root.after(0, update_ui)
-
-        except Exception as e:
-            def err():
-                bloquear_ui(False)
-                set_status("Erro na pesquisa ❌")
-                messagebox.showerror(APP_TITLE, f"Erro: {e}")
-            root.after(0, err)
-
-    threading.Thread(target=worker, daemon=True).start()
-
-# Sorting
-sort_state = {"col": None, "reverse": False}
-
-def ordenar_coluna(col):
-    reverse = False
-    if sort_state["col"] == col:
-        reverse = not sort_state["reverse"]
-
-    dados = []
-    for k in tree.get_children(""):
-        val = tree.set(k, col)
-        if col == "Preço":
-            n = extrair_preco(val) or 0
-            dados.append((n, k))
-        else:
-            dados.append((val.lower(), k))
-
-    dados.sort(reverse=reverse, key=lambda x: x[0])
-    for i, (_, k) in enumerate(dados):
-        tree.move(k, "", i)
-
-    sort_state["col"] = col
-    sort_state["reverse"] = reverse
+# =========================
+# EXPORT
+# =========================
 
 def exportar_csv():
     path = filedialog.asksaveasfilename(defaultextension=".csv")
     if not path:
         return
-
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, delimiter=";")
         writer.writerow(["Link", "Preço", "Negociável", "Novo", "Data", "Localização"])
         for k in tree.get_children():
             writer.writerow(tree.item(k)["values"])
-
     messagebox.showinfo(APP_TITLE, "CSV exportado com sucesso ✅")
 
 def exportar_xlsx():
     path = filedialog.asksaveasfilename(defaultextension=".xlsx")
     if not path:
         return
-
     wb = Workbook()
     ws = wb.active
     ws.title = APP_TITLE
     ws.append(["Link", "Preço", "Negociável", "Novo", "Data", "Localização"])
-
     for k in tree.get_children():
         ws.append(tree.item(k)["values"])
-
     for col in ws.columns:
         max_len = max(len(str(cell.value)) if cell.value else 0 for cell in col)
         ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 80)
-
     wb.save(path)
     messagebox.showinfo(APP_TITLE, "XLSX exportado com sucesso ✅")
+
 
 # =========================
 # UI
@@ -506,9 +571,8 @@ def exportar_xlsx():
 
 root = tk.Tk()
 root.title(APP_TITLE)
-root.geometry("1180x760")
+root.geometry("1240x800")
 
-# Top inputs
 frame_top = ttk.Frame(root)
 frame_top.pack(fill=tk.X, padx=10, pady=6)
 
@@ -540,106 +604,78 @@ btn_csv.grid(row=0, column=9, padx=6)
 btn_xlsx = ttk.Button(frame_top, text="Exportar XLSX", command=exportar_xlsx)
 btn_xlsx.grid(row=0, column=10, padx=6)
 
-# Alertas + Favoritos
+ttk.Label(frame_top, text="Auto-refresh").grid(row=0, column=11, sticky=tk.W, padx=(12, 0))
+var_refresh = tk.StringVar(value="Off")
+cmb_refresh = ttk.Combobox(frame_top, textvariable=var_refresh, values=list(REFRESH_OPTIONS.keys()), width=8, state="readonly")
+cmb_refresh.grid(row=0, column=12, padx=6)
+cmb_refresh.bind("<<ComboboxSelected>>", on_refresh_changed)
+
 frame_actions = ttk.Frame(root)
 frame_actions.pack(fill=tk.X, padx=10, pady=(0, 6))
 
 var_alertas = tk.BooleanVar(value=True)
-chk_alertas = ttk.Checkbutton(frame_actions, text="Alertar novos anúncios 🔔", variable=var_alertas)
-chk_alertas.pack(side=tk.LEFT)
+ttk.Checkbutton(frame_actions, text="Alertar novos anúncios 🔔", variable=var_alertas).pack(side=tk.LEFT)
 
 ttk.Button(frame_actions, text="⭐ Adicionar aos Favoritos", command=add_selected_to_favorites).pack(side=tk.LEFT, padx=12)
 
-# Filters
 frame_filters = ttk.Frame(root)
 frame_filters.pack(fill=tk.X, padx=12, pady=(2, 0))
 
 var_negociavel = tk.BooleanVar(value=False)
 var_abaixo_media = tk.BooleanVar(value=False)
 
-chk_negociavel = ttk.Checkbutton(frame_filters, text="Só negociáveis", variable=var_negociavel, command=aplicar_filtros)
-chk_negociavel.pack(side=tk.LEFT, padx=(0, 12))
+ttk.Checkbutton(frame_filters, text="Só negociáveis", variable=var_negociavel, command=on_filters_changed).pack(side=tk.LEFT, padx=(0, 12))
+ttk.Checkbutton(frame_filters, text="Só abaixo da média", variable=var_abaixo_media, command=on_filters_changed).pack(side=tk.LEFT, padx=(0, 18))
 
-chk_abaixo_media = ttk.Checkbutton(frame_filters, text="Só abaixo da média", variable=var_abaixo_media, command=aplicar_filtros)
-chk_abaixo_media.pack(side=tk.LEFT, padx=(0, 18))
-
-ttk.Label(frame_filters, text="Localização:").pack(side=tk.LEFT)
-
-var_loc_mode = tk.StringVar(value="Contém")
-cmb_loc_mode = ttk.Combobox(frame_filters, textvariable=var_loc_mode, values=["Contém", "Começa por", "Igual"], width=12, state="disabled")
-cmb_loc_mode.pack(side=tk.LEFT, padx=(8, 6))
-cmb_loc_mode.bind("<<ComboboxSelected>>", lambda e: aplicar_filtros())
-
-entry_loc = ttk.Entry(frame_filters, width=22, state="disabled")
+ttk.Label(frame_filters, text="Localização contém:").pack(side=tk.LEFT)
+entry_loc = ttk.Entry(frame_filters, width=22)
 entry_loc.pack(side=tk.LEFT, padx=6)
-entry_loc.bind("<KeyRelease>", lambda e: aplicar_filtros())
+entry_loc.bind("<KeyRelease>", lambda e: on_filters_changed())
 
-chk_negociavel.config(state="disabled")
-chk_abaixo_media.config(state="disabled")
-
-# Stats
 lbl_stats = ttk.Label(root, text="")
 lbl_stats.pack(anchor=tk.W, padx=12)
 
-# Progress + status
 progress_frame = ttk.Frame(root)
 progress_frame.pack(fill=tk.X, padx=12, pady=(6, 2))
 
-progress = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate", length=340)
+progress = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate", length=380)
 progress.pack(side=tk.LEFT)
 
 status_var = tk.StringVar(value="Pronto.")
 ttk.Label(progress_frame, textvariable=status_var).pack(side=tk.LEFT, padx=10)
 
-# Notebook (Resultados + Favoritos)
+# ✅ Notebook com abas em cima
 notebook = ttk.Notebook(root)
 notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
 
 tab_results = ttk.Frame(notebook)
 tab_favs = ttk.Frame(notebook)
-
 notebook.add(tab_results, text="Resultados")
 notebook.add(tab_favs, text="Favoritos")
 
-# Results table
-cols = ("Link", "Preço", "Negociável", "Novo", "Data", "Localização")
-tree = ttk.Treeview(tab_results, columns=cols, show="headings")
-for col in cols:
-    tree.heading(col, text=col, command=lambda c=col: ordenar_coluna(c))
+tree = ttk.Treeview(tab_results, columns=RESULT_COLS, show="headings")
+for col in RESULT_COLS:
+    tree.heading(col, text=col, command=lambda c=col: ordenar_treeview(tree, SORT_RESULTS, c, is_results=True))
     tree.column(col, anchor=tk.W)
 tree.tag_configure("bom_preco", background="#d4f4dd")
-tree.tag_configure("novo", background="#fff3b0")  # amarelo suave
+tree.tag_configure("novo", background="#fff3b0")
 tree.pack(fill=tk.BOTH, expand=True)
-
 tree.bind("<Double-1>", lambda e: abrir_link_de_tree(tree, e))
 
-# Favorites table
-fav_cols = ("Link", "Preço", "Negociável", "Data", "Localização")
-fav_tree = ttk.Treeview(tab_favs, columns=fav_cols, show="headings")
-for col in fav_cols:
-    fav_tree.heading(col, text=col)
+fav_tree = ttk.Treeview(tab_favs, columns=FAV_COLS, show="headings")
+for col in FAV_COLS:
+    fav_tree.heading(col, text=col, command=lambda c=col: ordenar_treeview(fav_tree, SORT_FAVS, c, is_results=False))
     fav_tree.column(col, anchor=tk.W)
 fav_tree.pack(fill=tk.BOTH, expand=True)
-
 fav_tree.bind("<Double-1>", lambda e: abrir_link_de_tree(fav_tree, e))
 
-# Favorites remove button
 fav_bottom = ttk.Frame(tab_favs)
 fav_bottom.pack(fill=tk.X, pady=6)
 ttk.Button(fav_bottom, text="🗑️ Remover dos Favoritos", command=remove_selected_favorite).pack(side=tk.LEFT)
 
-# Shortcuts
-def copiar_link_event(event=None):
-    # copia do separador activo
-    current = notebook.index(notebook.select())
-    if current == 0:
-        copiar_link_tree(tree)
-    else:
-        copiar_link_tree(fav_tree)
-
-root.bind("<Control-c>", copiar_link_event)
-
-# init favs
+# init
 refresh_favorites_tab()
+atualizar_setas_cabecalho_resultados()
+atualizar_setas_cabecalho_favs()
 
 root.mainloop()
