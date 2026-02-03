@@ -34,7 +34,7 @@ ALL_ANUNCIOS = []
 LAST_QUERY_KEY = ""
 LAST_SEARCH_PARAMS = None
 
-# Lock para impedir que o botão "Pesquisar" fique "preso"
+# Lock (evita “Pesquisar” preso)
 RUN_LOCK = threading.Lock()
 
 AUTO_REFRESH_JOB = None
@@ -131,14 +131,15 @@ def beep_alert():
             pass
 
 def ajustar_colunas(treeview):
-    MIN_W = {"Preço": 90, "Negociável": 90, "Data": 140, "Localização": 180, "Link": 420, "Novo": 70}
-    MAX_W = {"Preço": 140, "Negociável": 120, "Data": 260, "Localização": 360, "Link": 650, "Novo": 90}
+    # Limites bons p/ não “rebentar” o layout
+    MIN_W = {"Preço": 92, "Negociável": 105, "Data": 160, "Localização": 220, "Link": 520, "Novo": 70}
+    MAX_W = {"Preço": 160, "Negociável": 150, "Data": 320, "Localização": 520, "Link": 860, "Novo": 90}
 
     for col in treeview["columns"]:
         max_len = max([len(str(treeview.set(k, col))) for k in treeview.get_children()] + [len(col)])
         w = max_len * 8
         w = max(w, MIN_W.get(col, 100))
-        w = min(w, MAX_W.get(col, 650))
+        w = min(w, MAX_W.get(col, 900))
         treeview.column(col, width=w)
 
 
@@ -248,7 +249,10 @@ def aplicar_filtros():
 
     new_count = 0
     for a in filtrados:
-        row = tree.insert("", tk.END, values=(a["link"], a["preco"], a["negociavel"], a["novo"], a["data"], a["localizacao"]))
+        row = tree.insert(
+            "", tk.END,
+            values=(a["link"], a["preco"], a["negociavel"], a["novo"], a["data"], a["localizacao"])
+        )
         if a.get("novo") == "Y":
             tree.item(row, tags=("novo",))
             new_count += 1
@@ -257,11 +261,11 @@ def aplicar_filtros():
 
     if precos:
         lbl_stats.config(
-            text=f"Preço mín: {min(precos)} € | Preço máx: {max(precos)} € | "
-                 f"Preço médio: {int(preco_medio)} € | Anúncios: {len(filtrados)} | NOVOS: {new_count}"
+            text=f"Min: {min(precos)}€  •  Max: {max(precos)}€  •  Média: {int(preco_medio)}€  •  "
+                 f"Anúncios: {len(filtrados)}  •  Novos: {new_count}"
         )
     else:
-        lbl_stats.config(text=f"Sem preços válidos | Anúncios: {len(filtrados)} | NOVOS: {new_count}")
+        lbl_stats.config(text=f"Sem preços válidos  •  Anúncios: {len(filtrados)}  •  Novos: {new_count}")
 
     ajustar_colunas(tree)
     atualizar_setas_cabecalho_resultados()
@@ -311,7 +315,7 @@ def add_selected_to_favorites():
     favs = load_favorites()
 
     if any(f.get("link") == link for f in favs):
-        set_status("Já está nos favoritos ⭐")
+        set_status("⭐ Já está nos favoritos")
         return
 
     favs.append({
@@ -324,7 +328,7 @@ def add_selected_to_favorites():
     })
     save_favorites(favs)
     refresh_favorites_tab()
-    set_status("Adicionado aos favoritos ⭐")
+    set_status("⭐ Adicionado aos favoritos")
 
 def remove_selected_favorite():
     vals = get_selected_row_values(fav_tree)
@@ -335,13 +339,29 @@ def remove_selected_favorite():
     favs = [f for f in load_favorites() if f.get("link") != link]
     save_favorites(favs)
     refresh_favorites_tab()
-    set_status("Favorito removido 🗑️")
+    set_status("🗑️ Favorito removido")
 
-def abrir_link_de_tree(treeview, event):
+def abrir_link_selecionado(treeview):
+    vals = get_selected_row_values(treeview)
+    if not vals:
+        return
+    webbrowser.open(vals[0])
+
+def abrir_link_duplo_clique(treeview, event):
     item = treeview.identify_row(event.y)
-    if item:
-        link = treeview.item(item)["values"][0]
-        webbrowser.open(link)
+    if not item:
+        return
+    treeview.focus(item)
+    treeview.selection_set(item)
+    abrir_link_selecionado(treeview)
+
+def copiar_link_de_tree(treeview):
+    vals = get_selected_row_values(treeview)
+    if not vals:
+        return
+    root.clipboard_clear()
+    root.clipboard_append(vals[0])
+    set_status("📋 Link copiado")
 
 
 # =========================
@@ -370,7 +390,6 @@ def ordenar_treeview(treeview, sort_state, col, is_results=True):
     dados = []
     for item in treeview.get_children():
         valor = treeview.set(item, col)
-
         if col == "Preço":
             dados.append((extrair_preco(valor) or 0, item))
         elif col == "Novo":
@@ -415,25 +434,23 @@ def auto_refresh_tick():
     minutes = REFRESH_OPTIONS.get(var_refresh.get(), 0)
     if minutes <= 0:
         return
-
     if LAST_SEARCH_PARAMS:
         produto, min_price, max_price, max_pages = LAST_SEARCH_PARAMS
         run_search(produto, min_price, max_price, max_pages, is_auto=True)
-
     schedule_next_refresh(minutes)
 
 def on_refresh_changed(event=None):
     minutes = REFRESH_OPTIONS.get(var_refresh.get(), 0)
     if minutes <= 0:
         cancel_auto_refresh()
-        set_status(f"Auto-refresh: Off ({now_hhmmss()})")
+        set_status(f"⏱️ Auto: Off • {now_hhmmss()}")
         return
     schedule_next_refresh(minutes)
-    set_status(f"Auto-refresh: a cada {minutes} min ✅ ({now_hhmmss()})")
+    set_status(f"⏱️ Auto: {minutes} min • {now_hhmmss()}")
 
 
 # =========================
-# PESQUISA (robusta)
+# PESQUISA
 # =========================
 
 def set_controls_running(running: bool):
@@ -445,12 +462,13 @@ def set_controls_running(running: bool):
     entry_min.config(state=state)
     entry_max.config(state=state)
     entry_paginas.config(state=state)
+    cmb_refresh.config(state="disabled" if running else "readonly")
 
 def run_search(produto, min_price, max_price, max_pages, is_auto=False):
     global LAST_QUERY_KEY, ALL_ANUNCIOS, LAST_SEARCH_PARAMS
 
     if not RUN_LOCK.acquire(blocking=False):
-        set_status("Já estou a pesquisar… 🙂")
+        set_status("⏳ Pesquisa em curso…")
         return
 
     start_time = time.perf_counter()
@@ -465,13 +483,17 @@ def run_search(produto, min_price, max_price, max_pages, is_auto=False):
             only_neg = var_negociavel.get()
 
             def on_page(p):
-                root.after(0, lambda: (set_status(f"A pesquisar página {p}/{max_pages}…"), set_progress(p)))
+                root.after(0, lambda: (set_status(f"🔎 Página {p}/{max_pages}…"), set_progress(p)))
 
-            anuncios = pesquisar_olx(produto, min_price, max_price, max_pages, only_negotiable=only_neg, on_page_progress=on_page)
+            anuncios = pesquisar_olx(
+                produto, min_price, max_price, max_pages,
+                only_negotiable=only_neg,
+                on_page_progress=on_page
+            )
 
             if not anuncios:
                 elapsed = time.perf_counter() - start_time
-                root.after(0, lambda: set_status(f"0 anúncios encontrados ❗ ({elapsed:.1f}s)"))
+                root.after(0, lambda: set_status(f"⚠️ 0 anúncios ({elapsed:.1f}s)"))
                 return
 
             for a in anuncios:
@@ -488,13 +510,12 @@ def run_search(produto, min_price, max_price, max_pages, is_auto=False):
             def update_ui():
                 aplicar_filtros()
                 refresh_favorites_tab()
-
                 novos_no_filtro = contar_novos_dentro_do_filtro()
                 if novos_no_filtro > 0:
                     beep_alert()
-                    set_status(f"{'Auto-refresh' if is_auto else 'Pesquisa'} ✅ ({elapsed:.1f}s) — {novos_no_filtro} NOVO(s) no filtro 🔔 ({now_hhmmss()})")
+                    set_status(f"✅ {novos_no_filtro} novo(s) no filtro • {elapsed:.1f}s • {now_hhmmss()}")
                 else:
-                    set_status(f"{'Auto-refresh' if is_auto else 'Pesquisa'} ✅ ({elapsed:.1f}s) — sem novos no filtro ({now_hhmmss()})")
+                    set_status(f"✅ Sem novos no filtro • {elapsed:.1f}s • {now_hhmmss()}")
 
             root.after(0, update_ui)
 
@@ -507,9 +528,9 @@ def run_search(produto, min_price, max_price, max_pages, is_auto=False):
     if not is_auto:
         set_controls_running(True)
         set_progress(0, maximum=max_pages)
-        set_status("A iniciar pesquisa…")
+        set_status("🚀 A iniciar pesquisa…")
     else:
-        set_status(f"Auto-refresh a correr… ({now_hhmmss()})")
+        set_status(f"⏱️ Auto-refresh… {now_hhmmss()}")
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -525,7 +546,6 @@ def buscar():
     except ValueError:
         messagebox.showerror(APP_TITLE, "Preços/Páginas inválidos (usa números).")
         return
-
     run_search(produto, min_price, max_price, max_pages, is_auto=False)
 
 def on_filters_changed(*_):
@@ -544,9 +564,9 @@ def exportar_csv():
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, delimiter=";")
         writer.writerow(["Link", "Preço", "Negociável", "Novo", "Data", "Localização"])
-        for k in tree.get_children():
-            writer.writerow(tree.item(k)["values"])
-    messagebox.showinfo(APP_TITLE, "CSV exportado com sucesso ✅")
+        for item in tree.get_children():
+            writer.writerow(tree.item(item)["values"])
+    messagebox.showinfo(APP_TITLE, "CSV exportado ✅")
 
 def exportar_xlsx():
     path = filedialog.asksaveasfilename(defaultextension=".xlsx")
@@ -556,103 +576,116 @@ def exportar_xlsx():
     ws = wb.active
     ws.title = APP_TITLE
     ws.append(["Link", "Preço", "Negociável", "Novo", "Data", "Localização"])
-    for k in tree.get_children():
-        ws.append(tree.item(k)["values"])
+    for item in tree.get_children():
+        ws.append(tree.item(item)["values"])
     for col in ws.columns:
         max_len = max(len(str(cell.value)) if cell.value else 0 for cell in col)
         ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 80)
     wb.save(path)
-    messagebox.showinfo(APP_TITLE, "XLSX exportado com sucesso ✅")
+    messagebox.showinfo(APP_TITLE, "XLSX exportado ✅")
 
 
 # =========================
-# UI
+# UI (moderna)
 # =========================
 
 root = tk.Tk()
 root.title(APP_TITLE)
-root.geometry("1240x800")
+root.geometry("1280x820")
 
-frame_top = ttk.Frame(root)
-frame_top.pack(fill=tk.X, padx=10, pady=6)
+style = ttk.Style()
+try:
+    style.theme_use("clam")
+except Exception:
+    pass
 
-ttk.Label(frame_top, text="Produto").grid(row=0, column=0, sticky=tk.W)
-entry_produto = ttk.Entry(frame_top, width=28)
-entry_produto.grid(row=0, column=1, padx=6)
+style.configure("TButton", padding=(10, 6))
+style.configure("TLabel", padding=(2, 2))
+style.configure("TCheckbutton", padding=(6, 4))
+style.configure("Treeview", rowheight=28)
+style.configure("Treeview.Heading", padding=(6, 6))
 
-ttk.Label(frame_top, text="Preço mín").grid(row=0, column=2, sticky=tk.W)
-entry_min = ttk.Entry(frame_top, width=7)
+# Menu
+menubar = tk.Menu(root)
+menu_file = tk.Menu(menubar, tearoff=0)
+menu_file.add_command(label="Exportar CSV…", command=exportar_csv)
+menu_file.add_command(label="Exportar XLSX…", command=exportar_xlsx)
+menu_file.add_separator()
+menu_file.add_command(label="Sair", command=root.destroy)
+menubar.add_cascade(label="Ficheiro", menu=menu_file)
+root.config(menu=menubar)
+
+# Top bar
+top = ttk.Frame(root)
+top.pack(fill=tk.X, padx=14, pady=(12, 8))
+
+ttk.Label(top, text="Produto").grid(row=0, column=0, sticky=tk.W)
+entry_produto = ttk.Entry(top, width=32)
+entry_produto.grid(row=0, column=1, padx=(10, 18))
+
+ttk.Label(top, text="Min").grid(row=0, column=2, sticky=tk.W)
+entry_min = ttk.Entry(top, width=8)
 entry_min.insert(0, "0")
-entry_min.grid(row=0, column=3, padx=6)
+entry_min.grid(row=0, column=3, padx=(8, 14))
 
-ttk.Label(frame_top, text="Preço máx").grid(row=0, column=4, sticky=tk.W)
-entry_max = ttk.Entry(frame_top, width=7)
+ttk.Label(top, text="Max").grid(row=0, column=4, sticky=tk.W)
+entry_max = ttk.Entry(top, width=8)
 entry_max.insert(0, "9999")
-entry_max.grid(row=0, column=5, padx=6)
+entry_max.grid(row=0, column=5, padx=(8, 14))
 
-ttk.Label(frame_top, text="Páginas").grid(row=0, column=6, sticky=tk.W)
-entry_paginas = ttk.Entry(frame_top, width=5)
+ttk.Label(top, text="Páginas").grid(row=0, column=6, sticky=tk.W)
+entry_paginas = ttk.Entry(top, width=6)
 entry_paginas.insert(0, "10")
-entry_paginas.grid(row=0, column=7, padx=6)
+entry_paginas.grid(row=0, column=7, padx=(8, 18))
 
-btn_pesquisar = ttk.Button(frame_top, text="Pesquisar", command=buscar)
-btn_pesquisar.grid(row=0, column=8, padx=6)
+btn_pesquisar = ttk.Button(top, text="Pesquisar", command=buscar)
+btn_pesquisar.grid(row=0, column=8, padx=(0, 10))
 
-btn_csv = ttk.Button(frame_top, text="Exportar CSV", command=exportar_csv)
-btn_csv.grid(row=0, column=9, padx=6)
+btn_csv = ttk.Button(top, text="CSV", command=exportar_csv)
+btn_csv.grid(row=0, column=9, padx=(0, 8))
 
-btn_xlsx = ttk.Button(frame_top, text="Exportar XLSX", command=exportar_xlsx)
-btn_xlsx.grid(row=0, column=10, padx=6)
+btn_xlsx = ttk.Button(top, text="XLSX", command=exportar_xlsx)
+btn_xlsx.grid(row=0, column=10, padx=(0, 16))
 
-ttk.Label(frame_top, text="Auto-refresh").grid(row=0, column=11, sticky=tk.W, padx=(12, 0))
+ttk.Label(top, text="Auto").grid(row=0, column=11, sticky=tk.W)
 var_refresh = tk.StringVar(value="Off")
-cmb_refresh = ttk.Combobox(frame_top, textvariable=var_refresh, values=list(REFRESH_OPTIONS.keys()), width=8, state="readonly")
-cmb_refresh.grid(row=0, column=12, padx=6)
+cmb_refresh = ttk.Combobox(top, textvariable=var_refresh, values=list(REFRESH_OPTIONS.keys()), width=9, state="readonly")
+cmb_refresh.grid(row=0, column=12, padx=(8, 0))
 cmb_refresh.bind("<<ComboboxSelected>>", on_refresh_changed)
 
-frame_actions = ttk.Frame(root)
-frame_actions.pack(fill=tk.X, padx=10, pady=(0, 6))
+entry_produto.bind("<Return>", lambda e: buscar())
+
+# Filters row
+filters = ttk.Frame(root)
+filters.pack(fill=tk.X, padx=14, pady=(0, 6))
 
 var_alertas = tk.BooleanVar(value=True)
-ttk.Checkbutton(frame_actions, text="Alertar novos anúncios 🔔", variable=var_alertas).pack(side=tk.LEFT)
-
-ttk.Button(frame_actions, text="⭐ Adicionar aos Favoritos", command=add_selected_to_favorites).pack(side=tk.LEFT, padx=12)
-
-frame_filters = ttk.Frame(root)
-frame_filters.pack(fill=tk.X, padx=12, pady=(2, 0))
-
 var_negociavel = tk.BooleanVar(value=False)
 var_abaixo_media = tk.BooleanVar(value=False)
 
-ttk.Checkbutton(frame_filters, text="Só negociáveis", variable=var_negociavel, command=on_filters_changed).pack(side=tk.LEFT, padx=(0, 12))
-ttk.Checkbutton(frame_filters, text="Só abaixo da média", variable=var_abaixo_media, command=on_filters_changed).pack(side=tk.LEFT, padx=(0, 18))
+ttk.Checkbutton(filters, text="Alertas", variable=var_alertas).pack(side=tk.LEFT, padx=(0, 10))
+ttk.Checkbutton(filters, text="Só negociáveis", variable=var_negociavel, command=on_filters_changed).pack(side=tk.LEFT, padx=(0, 10))
+ttk.Checkbutton(filters, text="Só abaixo da média", variable=var_abaixo_media, command=on_filters_changed).pack(side=tk.LEFT, padx=(0, 14))
 
-ttk.Label(frame_filters, text="Localização contém:").pack(side=tk.LEFT)
-entry_loc = ttk.Entry(frame_filters, width=22)
-entry_loc.pack(side=tk.LEFT, padx=6)
+ttk.Label(filters, text="Localização contém").pack(side=tk.LEFT)
+entry_loc = ttk.Entry(filters, width=26)
+entry_loc.pack(side=tk.LEFT, padx=(10, 0))
 entry_loc.bind("<KeyRelease>", lambda e: on_filters_changed())
 
+# Stats
 lbl_stats = ttk.Label(root, text="")
-lbl_stats.pack(anchor=tk.W, padx=12)
+lbl_stats.pack(anchor=tk.W, padx=14)
 
-progress_frame = ttk.Frame(root)
-progress_frame.pack(fill=tk.X, padx=12, pady=(6, 2))
-
-progress = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate", length=380)
-progress.pack(side=tk.LEFT)
-
-status_var = tk.StringVar(value="Pronto.")
-ttk.Label(progress_frame, textvariable=status_var).pack(side=tk.LEFT, padx=10)
-
-# ✅ Notebook com abas em cima
+# Notebook
 notebook = ttk.Notebook(root)
-notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+notebook.pack(fill=tk.BOTH, expand=True, padx=14, pady=(10, 10))
 
 tab_results = ttk.Frame(notebook)
 tab_favs = ttk.Frame(notebook)
 notebook.add(tab_results, text="Resultados")
 notebook.add(tab_favs, text="Favoritos")
 
+# Tables
 tree = ttk.Treeview(tab_results, columns=RESULT_COLS, show="headings")
 for col in RESULT_COLS:
     tree.heading(col, text=col, command=lambda c=col: ordenar_treeview(tree, SORT_RESULTS, c, is_results=True))
@@ -660,18 +693,58 @@ for col in RESULT_COLS:
 tree.tag_configure("bom_preco", background="#d4f4dd")
 tree.tag_configure("novo", background="#fff3b0")
 tree.pack(fill=tk.BOTH, expand=True)
-tree.bind("<Double-1>", lambda e: abrir_link_de_tree(tree, e))
+tree.bind("<Double-1>", lambda e: abrir_link_duplo_clique(tree, e))
 
 fav_tree = ttk.Treeview(tab_favs, columns=FAV_COLS, show="headings")
 for col in FAV_COLS:
     fav_tree.heading(col, text=col, command=lambda c=col: ordenar_treeview(fav_tree, SORT_FAVS, c, is_results=False))
     fav_tree.column(col, anchor=tk.W)
 fav_tree.pack(fill=tk.BOTH, expand=True)
-fav_tree.bind("<Double-1>", lambda e: abrir_link_de_tree(fav_tree, e))
+fav_tree.bind("<Double-1>", lambda e: abrir_link_duplo_clique(fav_tree, e))
 
 fav_bottom = ttk.Frame(tab_favs)
-fav_bottom.pack(fill=tk.X, pady=6)
-ttk.Button(fav_bottom, text="🗑️ Remover dos Favoritos", command=remove_selected_favorite).pack(side=tk.LEFT)
+fav_bottom.pack(fill=tk.X, pady=8)
+ttk.Button(fav_bottom, text="Remover", command=remove_selected_favorite).pack(side=tk.LEFT, padx=(0, 8))
+
+# Context menus
+menu_results = tk.Menu(root, tearoff=0)
+menu_results.add_command(label="Abrir", command=lambda: abrir_link_selecionado(tree))
+menu_results.add_command(label="Copiar link", command=lambda: copiar_link_de_tree(tree))
+menu_results.add_separator()
+menu_results.add_command(label="Adicionar aos favoritos", command=add_selected_to_favorites)
+
+menu_favs = tk.Menu(root, tearoff=0)
+menu_favs.add_command(label="Abrir", command=lambda: abrir_link_selecionado(fav_tree))
+menu_favs.add_command(label="Copiar link", command=lambda: copiar_link_de_tree(fav_tree))
+menu_favs.add_separator()
+menu_favs.add_command(label="Remover", command=remove_selected_favorite)
+
+def show_context_menu_results(event):
+    row = tree.identify_row(event.y)
+    if row:
+        tree.selection_set(row)
+        tree.focus(row)
+    menu_results.tk_popup(event.x_root, event.y_root)
+
+def show_context_menu_favs(event):
+    row = fav_tree.identify_row(event.y)
+    if row:
+        fav_tree.selection_set(row)
+        fav_tree.focus(row)
+    menu_favs.tk_popup(event.x_root, event.y_root)
+
+tree.bind("<Button-3>", show_context_menu_results)
+fav_tree.bind("<Button-3>", show_context_menu_favs)
+
+# Status bar
+statusbar = ttk.Frame(root)
+statusbar.pack(fill=tk.X, padx=14, pady=(0, 12))
+
+progress = ttk.Progressbar(statusbar, orient="horizontal", mode="determinate", length=420)
+progress.pack(side=tk.LEFT)
+
+status_var = tk.StringVar(value="Pronto.")
+ttk.Label(statusbar, textvariable=status_var).pack(side=tk.LEFT, padx=12)
 
 # init
 refresh_favorites_tab()
